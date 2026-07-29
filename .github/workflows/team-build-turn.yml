@@ -1,0 +1,229 @@
+name: Team Build Turn
+
+# Spec §8. Triggered by the Cloudflare Worker via the GitHub API
+# (workflow_dispatch or repository_dispatch, per §8) once per agent build
+# turn — NOT continuously. Each run is a fresh, isolated VM (4 CPU / 16GB RAM
+# on public repos, confirmed from GitHub's own runner docs) that checks out
+# the repo, builds, commits, and exits. Git history is the persistence layer
+# between turns.
+#
+# Agent driver: OpenCode (opencode.ai), confirmed real/active/MIT-licensed,
+# with a documented non-interactive `opencode run` command meant for exactly
+# this kind of scripted CI use, and a custom-provider config path
+# (docker/opencode.json, OPENCODE_CONFIG) for pointing it at Workers AI
+# instead of a natively-supported provider. This replaces what would
+# otherwise be custom-built agent-loop code.
+
+on:
+  workflow_dispatch:
+    inputs:
+      team:
+        description: "Which team's build (alpha or beta)"
+        required: true
+        type: choice
+        options: [alpha, beta]
+      turn_id:
+        description: "Opaque turn identifier from the event engine, for log correlation"
+        required: true
+        type: string
+      task_prompt:
+        description: "What this turn's agent should work on"
+        required: true
+        type: string
+  repository_dispatch:
+    types: [team-build-turn]
+
+concurrency:
+  group: build-turn-${{ github.event.inputs.team || github.event.client_payload.team }}
+  cancel-in-progress: false
+
+# The default GITHUB_TOKEN is read-only unless a repo/org's Actions settings
+# override it — don't rely on that being set globally, since a fresh repo
+# won't have it. Declare write access explicitly so "Commit progress"'s
+# `git push` (spec §8) works regardless of the repo-level default.
+permissions:
+  contents: write
+
+jobs:
+  build-turn:
+    runs-on: ubuntu-latest # 4 CPU / 16GB RAM / 14GB SSD on public repos, confirmed July 2026
+    timeout-minutes: 120 # well under the 6-hour hard cap; a single turn should never need this long
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      # Workers AI, not Groq, runs the agent-work step below: OpenCode's own
+      # baseline request (system prompt + tool schemas) measures ~32-38K
+      # tokens, which exceeds every Groq free-tier model's TPM cap (max 12K,
+      # spec §5) on the very first call. Workers AI's 10K Neurons/day is a
+      # daily budget, not a per-minute token throttle, so it doesn't hit the
+      # same wall. GROQ_API_KEY above stays wired for whatever still uses it
+      # directly (§6 router, once Week 1 lands) — it's just not what
+      # opencode calls in this step anymore.
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+    steps:
+      - name: Checkout team repo at current state
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build team base image
+        # arena-team-base:latest doesn't persist between jobs (each run is a
+        # fresh VM), so it's built fresh here from docker/Dockerfile.arena-team-base
+        # every turn. If this step's ~10-20s becomes a real cost across many
+        # turns, push the built image to GHCR once and pull it here instead.
+        run: docker build -t arena-team-base:latest -f docker/Dockerfile.arena-team-base docker/
+
+      - name: Start egress-filtering proxy (spec §7 network scoping)
+        # Found live (2026-07-22 code review): the previous "SCOPED" comment
+        # on Phase A was aspirational — the docker run below it had no actual
+        # network restriction, full open egress, while injecting CF_API_TOKEN
+        # into a container running an AI agent with --auto (self-approving)
+        # against arbitrary prompts. Real secret-exfiltration risk.
+        #
+        # Real fix, not just a corrected comment: a Squid forward proxy on
+        # the RUNNER (not inside the sandboxed container) with a domain
+        # allowlist, combined with Docker's documented DOCKER-USER iptables
+        # chain (https://docs.docker.com/engine/network/packet-filtering-firewalls/)
+        # to DROP any container-originated traffic on 80/443 that doesn't go
+        # through the proxy. Even if something inside the container ignores
+        # the HTTP_PROXY/HTTPS_PROXY env vars set below (a compromised npm
+        # postinstall script, Node's built-in fetch, etc.), it physically
+        # cannot reach the internet directly — DOCKER-USER rules apply to all
+        # container traffic, they're not something a process inside the
+        # container can opt out of.
+        #
+        # Only 2 domains allowed, matching what Phase A's container actually
+        # touches (checked docker/opencode.json + Dockerfile.arena-team-base
+        # directly rather than guessing): api.cloudflare.com (Workers AI,
+        # opencode.json's baseURL) and registry.npmjs.org (whatever the
+        # coding agent's own build needs to npm install). github.com/
+        # api.github.com are deliberately NOT allowlisted — the "Commit
+        # progress" step below does git push from the RUNNER, outside any
+        # container, so nothing inside Phase A's container legitimately
+        # needs GitHub access at all.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq squid
+          sudo tee /etc/squid/squid.conf > /dev/null <<'EOF'
+          http_port 3128
+          acl allowed_ssl_ports port 443
+          acl CONNECT method CONNECT
+          acl allowed_domains dstdomain .api.cloudflare.com .registry.npmjs.org
+          http_access allow CONNECT allowed_domains allowed_ssl_ports
+          http_access allow allowed_domains
+          http_access deny all
+          EOF
+          sudo systemctl restart squid
+          # DOCKER-USER: Docker's own hook chain for custom container-egress
+          # firewall rules — inserted rules here apply to traffic FORWARDED
+          # through docker's bridge (i.e. from containers), not to the
+          # runner/host's own traffic, so the proxy itself (running on the
+          # host, not in a container) is unaffected by these DROP rules.
+          sudo iptables -I DOCKER-USER -p tcp --dport 443 -j DROP
+          sudo iptables -I DOCKER-USER -p tcp --dport 80 -j DROP
+
+      - name: "Phase A — agent work (network-scoped to api.cloudflare.com + registry.npmjs.org)"
+        # HOME=/tmp below: OpenCode (Bun) writes its config/cache to
+        # $HOME/.local on startup; the read-only rootfs has no writable
+        # /home, so it needs to land inside the tmpfs already mounted at /tmp.
+        #
+        # --user "$(id -u):$(id -g)" (not a hardcoded 1000:1000): /workspace
+        # is bind-mounted from the runner's checkout, owned by the runner's
+        # actual uid — a mismatched uid can't write into it even though the
+        # bind mount itself is :rw, since real file-mode bits still apply.
+        # Still never uid 0, so the non-root intent (spec §7) holds either way.
+        #
+        # --add-host=host.docker.internal:host-gateway + HTTP(S)_PROXY: routes
+        # the container's outbound HTTP/HTTPS through the Squid proxy started
+        # above (which runs on the runner host, reachable via the Docker-
+        # provided host-gateway alias) — the DOCKER-USER DROP rules block any
+        # attempt to bypass it and go direct.
+        run: |
+          docker run --rm \
+            --cpus="2" --memory="4g" --memory-swap="4g" --pids-limit=100 \
+            --read-only \
+            --tmpfs /tmp:noexec,nosuid,size=500m,mode=1777 \
+            --user="$(id -u):$(id -g)" --cap-drop=ALL --security-opt=no-new-privileges:true \
+            --add-host=host.docker.internal:host-gateway \
+            -e HTTP_PROXY=http://host.docker.internal:3128 \
+            -e HTTPS_PROXY=http://host.docker.internal:3128 \
+            -e NO_PROXY=localhost,127.0.0.1 \
+            -e CF_ACCOUNT_ID \
+            -e CF_API_TOKEN \
+            -e HOME=/tmp \
+            -v "${{ github.workspace }}:/workspace:rw" \
+            -w /workspace \
+            arena-team-base:latest \
+            opencode run "${{ inputs.task_prompt || github.event.client_payload.task_prompt }}" \
+              --model workers-ai/@cf/openai/gpt-oss-120b \
+              --auto \
+              --format json > opencode-turn.log
+        # --auto approves OpenCode's own permission prompts (needed since
+        # there's no human to click "yes" in CI) — the container's cap-drop
+        # and non-root user are what actually bound what --auto can do, not
+        # OpenCode's own permission system alone. --format json makes the log
+        # machine-parseable for the Observatory (spec §11) instead of just
+        # human-readable TUI output.
+
+      - name: Show turn log (debug)
+        if: always()
+        run: cat opencode-turn.log 2>/dev/null || echo "opencode-turn.log not found"
+
+      - name: Enforce real build output
+        # Found live (see docs/INVESTIGATION_2026-07-28.md P0-0a / NEW-1): a
+        # build turn can emit a text essay, invoke zero tools, write zero
+        # files, and still exit 0 — `opencode run` succeeding only means the
+        # CLI didn't crash, not that any work happened. This was the actual
+        # gap behind build_pipeline's gate passing while both closed-beta
+        # team repos ended up with no product code. Fail here, before Phase B
+        # or the commit step, so a no-op turn is reported as a failure
+        # instead of a silent success.
+        run: |
+          CHANGED=$(git status --porcelain -- . ':!opencode-turn.log')
+          if [ -z "$CHANGED" ]; then
+            echo "::error::Build turn produced no file changes outside opencode-turn.log — the agent emitted text without writing any files. Failing the job instead of reporting a false success."
+            exit 1
+          fi
+          echo "Files changed this turn:"
+          echo "$CHANGED"
+
+      - name: Phase B — locked-down verification (network=none)
+        # This step runs fully --network=none — it runs AFTER the agent's
+        # network-needing work is done, testing/building the code that was
+        # just written, with zero network access during execution. Defense in
+        # depth against the generated code itself trying to exfiltrate
+        # anything, independent of
+        # whether the agent that wrote it was trustworthy.
+        run: |
+          docker run --rm \
+            --cpus="2" --memory="4g" --memory-swap="4g" --pids-limit=50 \
+            --network=none --read-only \
+            --tmpfs /tmp:noexec,nosuid,size=200m,mode=1777 \
+            --user="$(id -u):$(id -g)" --cap-drop=ALL --security-opt=no-new-privileges:true \
+            -v "${{ github.workspace }}:/workspace:rw" \
+            -w /workspace \
+            arena-team-base:latest \
+            sh -c 'test -f package.json && npm test --if-present || echo "no test suite yet, skipping"'
+
+      - name: Commit progress
+        run: |
+          git config user.name "arena-bot[${{ github.event.inputs.team || github.event.client_payload.team }}]"
+          git config user.email "arena-bot@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "Build turn ${{ github.event.inputs.turn_id || github.event.client_payload.turn_id }}"
+          git push
+
+      - name: Upload turn log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-turn-${{ github.event.inputs.turn_id || github.event.client_payload.turn_id }}
+          path: |
+            opencode-turn.log
+            **/*.log
+          if-no-files-found: ignore
+          retention-days: 30
+# Re-pushed 2026-07-23 to trigger GitHub Actions workflow_dispatch re-indexing
+# (recurring GitHub quirk, same fix as before — dispatches 422 with
+# "Workflow does not have 'workflow_dispatch' trigger" immediately after a
+# push that touches this file, even though the trigger is clearly present).
