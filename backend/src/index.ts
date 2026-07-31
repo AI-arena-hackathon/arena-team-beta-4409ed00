@@ -41,6 +41,25 @@ app.post("/api/inventory", (req, res) => {
   res.status(201).json(vehicle);
 });
 
+// Connector endpoint - simulate pushing vehicle data to external DMS
+app.post("/api/connector", (req, res) => {
+  const vehicle = req.body;
+  if (!vehicle || !vehicle.vin) {
+    return res.status(400).json({ error: "Vehicle must include VIN" });
+  }
+  console.log("Connector: pushing vehicle to DMS", vehicle);
+  inventory.push(vehicle);
+  if (wss && wss.clients) {
+    const message = JSON.stringify({ type: "new_vehicle", payload: vehicle });
+    wss.clients.forEach((client) => {
+      if (client.readyState === 1) {
+        client.send(message);
+      }
+    });
+  }
+  res.status(202).json({ status: "queued", vehicle });
+});
+
 const PORT = process.env.PORT || 4000;
 // Start HTTP server
 const server = app.listen(PORT, () => {
